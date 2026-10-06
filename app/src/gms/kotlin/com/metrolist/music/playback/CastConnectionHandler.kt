@@ -2,13 +2,17 @@ package com.metrolist.music.playback
 
 import android.content.Context
 import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.PowerManager
 import androidx.media3.cast.RemoteCastPlayer
 import androidx.media3.cast.SessionAvailabilityListener
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.common.util.UnstableApi
 import com.google.android.gms.cast.framework.CastContext
 import com.metrolist.music.extensions.metadata
@@ -61,11 +65,45 @@ class CastConnectionHandler(
     private var positionJob: Job? = null
     private var loadJob: Job? = null
     private var extensionJob: Job? = null
+    private var queueSyncJob: Job? = null
     private var syncResetJob: Job? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     private val playerListener =
         object : Player.Listener {
-            override fun onPlaybackStateChanged(playbackState: Int) = updatePlayerState()
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                updatePlayerState()
+                if (playbackState == Player.STATE_ENDED && _isCasting.value) {
+                    val localPlayer = musicService.player
+                    val nextIndex =
+                        localPlayer.currentTimeline.getNextWindowIndex(
+                            localPlayer.currentMediaItemIndex,
+                            Player.REPEAT_MODE_OFF,
+                            localPlayer.shuffleModeEnabled,
+                        )
+                    if (nextIndex != C.INDEX_UNSET) {
+                        localPlayer.seekTo(nextIndex, 0L)
+                        loadCurrentMedia()
+                    }
+                }
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                Timber.e(error, "Cast player error: ${error.errorCodeName} (${error.errorCode})")
+                scope.launch {
+                    delay(500)
+                    if (!_isCasting.value) return@launch
+                    val localPlayer = musicService.player
+                    if (localPlayer.hasNextMediaItem()) {
+                        localPlayer.pause()
+                        localPlayer.seekToNextMediaItem()
+                        loadCurrentMedia()
+                    } else {
+                        loadCurrentMedia()
+                    }
+                }
+            }
 
             override fun onPlayWhenReadyChanged(
                 playWhenReady: Boolean,
@@ -81,7 +119,9 @@ class CastConnectionHandler(
                 mediaItem: MediaItem?,
                 reason: Int,
             ) {
-                mediaItem?.mediaId?.let(::syncLocalPlayer)
+                val mediaId = mediaItem?.mediaId ?: runCatching { castPlayer?.currentMediaItem?.mediaId }.getOrNull()
+                mediaId?.let(::syncLocalPlayer)
+                prunePlayedItems()
                 appendQueueIfNeeded()
                 updatePlayerState()
             }
@@ -90,6 +130,7 @@ class CastConnectionHandler(
     private val sessionListener =
         object : SessionAvailabilityListener {
             override fun onCastSessionAvailable() {
+                acquireLocks()
                 _isCasting.value = true
                 _castDeviceName.value =
                     castContext
@@ -106,7 +147,8 @@ class CastConnectionHandler(
                 if (player.mediaItemCount == 0) {
                     loadCurrentMedia()
                 } else {
-                    player.currentMediaItem?.mediaId?.let(::syncLocalPlayer)
+                    val currentItem = runCatching { player.currentMediaItem }.getOrNull()
+                    currentItem?.mediaId?.let(::syncLocalPlayer)
                 }
             }
 
@@ -115,12 +157,22 @@ class CastConnectionHandler(
                 if (player != null && player.currentPosition > 0) {
                     musicService.player.seekTo(player.currentPosition)
                 }
+                releaseLocks()
                 _isCasting.value = false
                 _castDeviceName.value = null
                 _castIsPlaying.value = false
                 _castIsBuffering.value = false
                 stopPositionUpdates()
                 musicService.player.pause()
+            }
+        }
+
+    private val localPlayerListener =
+        object : Player.Listener {
+            override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+                if (_isCasting.value) {
+                    syncQueueFromLocalPlayer()
+                }
             }
         }
 
@@ -139,6 +191,7 @@ class CastConnectionHandler(
                             sessionListener.onCastSessionAvailable()
                         }
                     }
+            musicService.player.addListener(localPlayerListener)
             true
         }.getOrElse { error ->
             Timber.e(error, "Failed to initialize Cast")
@@ -165,8 +218,8 @@ class CastConnectionHandler(
 
                 val indices = queueIndices(centerIndex)
                 val items = indices.mapNotNull { resolvedMediaItem(it) }
-                val startIndex = indices.takeWhile { it != centerIndex }.size
-                if (items.size != indices.size || startIndex !in items.indices) {
+                val targetIndex = items.indexOfFirst { it.mediaId == metadata.id }
+                if (targetIndex == -1) {
                     Timber.w("Unable to resolve the Cast queue for ${metadata.id}")
                     return@launch
                 }
@@ -178,7 +231,7 @@ class CastConnectionHandler(
                         0L
                     }
                 castPlayer?.apply {
-                    setMediaItems(items, startIndex, startPosition)
+                    setMediaItems(items, targetIndex, startPosition)
                     prepare()
                     play()
                 }
@@ -206,10 +259,16 @@ class CastConnectionHandler(
 
     fun navigateToMediaIfInQueue(mediaId: String): Boolean {
         val player = castPlayer ?: return false
-        repeat(player.mediaItemCount) { index ->
-            if (player.getMediaItemAt(index).mediaId == mediaId) {
-                if (index != player.currentMediaItemIndex) player.seekTo(index, 0L)
+        val count = player.mediaItemCount
+        if (count <= 0) return false
+        for (index in 0 until count) {
+            val item = runCatching { player.getMediaItemAt(index) }.getOrNull() ?: continue
+            if (item.mediaId == mediaId) {
+                if (index != player.currentMediaItemIndex) {
+                    runCatching { player.seekTo(index, 0L) }
+                }
                 musicService.player.pause()
+                syncLocalPlayer(mediaId)
                 return true
             }
         }
@@ -223,6 +282,7 @@ class CastConnectionHandler(
         } else if (musicService.player.hasNextMediaItem()) {
             musicService.player.pause()
             musicService.player.seekToNextMediaItem()
+            loadCurrentMedia()
         }
     }
 
@@ -233,6 +293,7 @@ class CastConnectionHandler(
         } else if (musicService.player.hasPreviousMediaItem()) {
             musicService.player.pause()
             musicService.player.seekToPreviousMediaItem()
+            loadCurrentMedia()
         }
     }
 
@@ -256,20 +317,115 @@ class CastConnectionHandler(
             }
     }
 
-    private fun appendQueueIfNeeded() {
+    fun syncQueueFromLocalPlayer() {
+        if (!_isCasting.value) return
         val player = castPlayer ?: return
-        if (extensionJob?.isActive == true || player.currentMediaItemIndex < player.mediaItemCount - 2) return
+        val localPlayer = musicService.player
+        if (localPlayer.currentTimeline.isEmpty) return
+
+        val currentCastMediaId = runCatching { player.currentMediaItem?.mediaId }.getOrNull()
+        if (currentCastMediaId != null) {
+            val localIndex = localPlayer.indexOfMediaId(currentCastMediaId)
+            if (localIndex == C.INDEX_UNSET) {
+                Timber.d("Current Cast item $currentCastMediaId was removed from queue; reloading current media")
+                loadCurrentMedia()
+                return
+            }
+        } else if (player.mediaItemCount == 0) {
+            loadCurrentMedia()
+            return
+        }
+
+        queueSyncJob?.cancel()
+        queueSyncJob =
+            scope.launch {
+                val currentCastIdx = player.currentMediaItemIndex
+                val castCount = player.mediaItemCount
+                if (currentCastIdx !in 0 until castCount) return@launch
+
+                val currentMediaId = runCatching { player.getMediaItemAt(currentCastIdx).mediaId }.getOrNull() ?: return@launch
+                val localCenterIdx = localPlayer.indexOfMediaId(currentMediaId)
+                if (localCenterIdx == C.INDEX_UNSET) {
+                    loadCurrentMedia()
+                    return@launch
+                }
+
+                val upcomingCastCount = castCount - 1 - currentCastIdx
+                var needsRebuildUpcoming = false
+
+                val timeline = localPlayer.currentTimeline
+                val expectedUpcomingIds = mutableListOf<String>()
+                var tempIdx = localCenterIdx
+                while (expectedUpcomingIds.size < 3) {
+                    tempIdx = timeline.getNextWindowIndex(tempIdx, Player.REPEAT_MODE_OFF, localPlayer.shuffleModeEnabled)
+                    if (tempIdx == C.INDEX_UNSET) break
+                    val localItem = runCatching { localPlayer.getMediaItemAt(tempIdx) }.getOrNull() ?: break
+                    expectedUpcomingIds.add(localItem.mediaId)
+                }
+
+                if (upcomingCastCount != expectedUpcomingIds.size) {
+                    needsRebuildUpcoming = true
+                } else {
+                    for (i in 0 until upcomingCastCount) {
+                        val castItem = runCatching { player.getMediaItemAt(currentCastIdx + 1 + i) }.getOrNull()
+                        if (castItem == null || castItem.mediaId != expectedUpcomingIds.getOrNull(i)) {
+                            needsRebuildUpcoming = true
+                            break
+                        }
+                    }
+                }
+
+                if (needsRebuildUpcoming) {
+                    Timber.d("Upcoming Cast queue differs from local player; resyncing upcoming items")
+                    if (upcomingCastCount > 0) {
+                        runCatching { player.removeMediaItems(currentCastIdx + 1, castCount) }
+                    }
+                    val itemsToAdd = expectedUpcomingIds.mapNotNull { mediaId ->
+                        val idx = localPlayer.indexOfMediaId(mediaId)
+                        if (idx != C.INDEX_UNSET) resolvedMediaItem(idx) else null
+                    }
+                    if (itemsToAdd.isNotEmpty()) {
+                        runCatching { player.addMediaItems(itemsToAdd) }
+                    }
+                }
+            }
+    }
+
+    private fun prunePlayedItems() {
+        val player = castPlayer ?: return
+        val currentIndex = player.currentMediaItemIndex
+        if (currentIndex > 2) {
+            val toRemove = currentIndex - 2
+            runCatching { player.removeMediaItems(0, toRemove) }
+        }
+    }
+
+    fun appendQueueIfNeeded() {
+        val player = castPlayer ?: return
+        val count = player.mediaItemCount
+        val currentIndex = player.currentMediaItemIndex
+        if (extensionJob?.isActive == true || count <= 0) return
+        val upcomingCount = count - 1 - currentIndex
+        if (upcomingCount >= 3) return
 
         extensionJob =
             scope.launch {
-                if (player.mediaItemCount == 0) return@launch
-                val lastMediaId = player.getMediaItemAt(player.mediaItemCount - 1).mediaId
+                val lastMediaId = runCatching {
+                    val currentCount = player.mediaItemCount
+                    if (currentCount <= 0) null
+                    else player.getMediaItemAt(currentCount - 1).mediaId
+                }.getOrNull() ?: return@launch
+
                 val localPlayer = musicService.player
                 var index = localPlayer.indexOfMediaId(lastMediaId)
+                if (index == C.INDEX_UNSET) {
+                    index = localPlayer.currentMediaItemIndex
+                }
                 if (index == C.INDEX_UNSET || localPlayer.currentTimeline.isEmpty) return@launch
 
+                val needed = 3 - upcomingCount
                 val indices = mutableListOf<Int>()
-                while (indices.size < 2) {
+                while (indices.size < needed) {
                     index =
                         localPlayer.currentTimeline.getNextWindowIndex(
                             index,
@@ -280,7 +436,9 @@ class CastConnectionHandler(
                     indices += index
                 }
                 val items = indices.mapNotNull { resolvedMediaItem(it) }
-                if (items.isNotEmpty()) player.addMediaItems(items)
+                if (items.isNotEmpty()) {
+                    runCatching { player.addMediaItems(items) }
+                }
             }
     }
 
@@ -299,7 +457,7 @@ class CastConnectionHandler(
 
         val next = mutableListOf<Int>()
         index = centerIndex
-        while (next.size < 2) {
+        while (next.size < 3) {
             index = timeline.getNextWindowIndex(index, Player.REPEAT_MODE_OFF, player.shuffleModeEnabled)
             if (index == C.INDEX_UNSET) break
             next += index
@@ -307,30 +465,36 @@ class CastConnectionHandler(
         return previous + centerIndex + next
     }
 
-    private suspend fun resolvedMediaItem(index: Int): MediaItem? {
-        val item = musicService.player.getMediaItemAt(index)
-        val metadata = item.metadata ?: return null
-        val streamUrl = musicService.getStreamUrl(metadata.id) ?: return null
-        val castMetadata =
-            item.mediaMetadata
+    private suspend fun resolvedMediaItem(index: Int): MediaItem? =
+        runCatching {
+            val player = musicService.player
+            if (index !in 0 until player.mediaItemCount) return null
+            val item = player.getMediaItemAt(index)
+            val metadata = item.metadata ?: return null
+            val streamUrl = musicService.getStreamUrl(metadata.id) ?: return null
+            val castMetadata =
+                item.mediaMetadata
+                    .buildUpon()
+                    .setTitle(metadata.title)
+                    .setArtist(metadata.artists.joinToString(", ") { it.name })
+                    .setAlbumTitle(metadata.album?.title)
+                    .setArtworkUri(metadata.thumbnailUrl?.resize(1080, 1080)?.let(Uri::parse))
+                    .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+                    .build()
+            item
                 .buildUpon()
-                .setTitle(metadata.title)
-                .setArtist(metadata.artists.joinToString(", ") { it.name })
-                .setAlbumTitle(metadata.album?.title)
-                .setArtworkUri(metadata.thumbnailUrl?.resize(1080, 1080)?.let(Uri::parse))
-                .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+                .setUri(streamUrl)
+                .setMimeType(MimeTypes.AUDIO_MP4)
+                .setMediaMetadata(castMetadata)
                 .build()
-        return item
-            .buildUpon()
-            .setUri(streamUrl)
-            .setMimeType(MimeTypes.AUDIO_MP4)
-            .setMediaMetadata(castMetadata)
-            .build()
-    }
+        }.getOrNull()
 
     private fun Player.indexOfMediaId(mediaId: String): Int {
-        repeat(mediaItemCount) { index ->
-            if (getMediaItemAt(index).mediaId == mediaId) return index
+        val count = mediaItemCount
+        if (count <= 0) return C.INDEX_UNSET
+        for (index in 0 until count) {
+            val item = runCatching { getMediaItemAt(index) }.getOrNull() ?: continue
+            if (item.mediaId == mediaId) return index
         }
         return C.INDEX_UNSET
     }
@@ -349,6 +513,33 @@ class CastConnectionHandler(
         val player = castPlayer ?: return
         val maxVolume = player.deviceInfo.maxVolume
         if (maxVolume > 0) _castVolume.value = player.deviceVolume.toFloat() / maxVolume
+    }
+
+    private fun acquireLocks() {
+        runCatching {
+            if (wakeLock == null) {
+                val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Metrolist:CastWakeLock")
+            }
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire(3 * 60 * 60 * 1000L)
+            }
+            if (wifiLock == null) {
+                val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                @Suppress("DEPRECATION")
+                wifiLock = wifiManager?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Metrolist:CastWifiLock")
+            }
+            if (wifiLock?.isHeld == false) {
+                wifiLock?.acquire()
+            }
+        }.onFailure { Timber.e(it, "Failed to acquire Cast wake/wifi locks") }
+    }
+
+    private fun releaseLocks() {
+        runCatching {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+            if (wifiLock?.isHeld == true) wifiLock?.release()
+        }.onFailure { Timber.e(it, "Failed to release Cast wake/wifi locks") }
     }
 
     private fun startPositionUpdates() {
@@ -373,8 +564,11 @@ class CastConnectionHandler(
     fun release() {
         loadJob?.cancel()
         extensionJob?.cancel()
+        queueSyncJob?.cancel()
         syncResetJob?.cancel()
         stopPositionUpdates()
+        releaseLocks()
+        musicService.player.removeListener(localPlayerListener)
         castPlayer?.removeListener(playerListener)
         castPlayer?.release()
         castPlayer = null

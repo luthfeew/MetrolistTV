@@ -43,5 +43,9 @@ class CastConnectionHandler(
 
     fun navigateToMediaIfInQueue(mediaId: String) = false
 
+    fun appendQueueIfNeeded() = Unit
+
+    fun syncQueueFromLocalPlayer() = Unit
+
     fun release() = Unit
 }

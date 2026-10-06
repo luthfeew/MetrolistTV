@@ -652,9 +652,10 @@ class PlayerConnection(
     }
 
     private fun updateCanSkipPreviousAndNext() {
-        if (!player.currentTimeline.isEmpty) {
+        val currentIndex = player.currentMediaItemIndex
+        if (!player.currentTimeline.isEmpty && currentIndex in 0 until player.currentTimeline.windowCount) {
             val window =
-                player.currentTimeline.getWindow(player.currentMediaItemIndex, Timeline.Window())
+                player.currentTimeline.getWindow(currentIndex, Timeline.Window())
             canSkipPrevious.value = player.isCommandAvailable(COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM) ||
                 !window.isLive ||
                 player.isCommandAvailable(COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)

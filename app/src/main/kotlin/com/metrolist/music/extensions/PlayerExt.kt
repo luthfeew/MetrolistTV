@@ -42,6 +42,9 @@ fun Player.getQueueWindows(): List<Timeline.Window> {
     val queueSize = timeline.windowCount
 
     val currentMediaItemIndex: Int = currentMediaItemIndex
+    if (currentMediaItemIndex !in 0 until timeline.windowCount) {
+        return emptyList()
+    }
     queue.add(timeline.getWindow(currentMediaItemIndex, Timeline.Window()))
 
     var firstMediaItemIndex = currentMediaItemIndex
@@ -70,7 +73,7 @@ fun Player.getQueueWindows(): List<Timeline.Window> {
 }
 
 fun Player.getCurrentQueueIndex(): Int {
-    if (currentTimeline.isEmpty) {
+    if (currentTimeline.isEmpty || currentMediaItemIndex == C.INDEX_UNSET) {
         return -1
     }
     var index = 0
@@ -89,7 +92,7 @@ fun Player.getCurrentQueueIndex(): Int {
 }
 
 val Player.currentMetadata: MediaMetadata?
-    get() = currentMediaItem?.metadata
+    get() = runCatching { currentMediaItem?.metadata }.getOrNull()
 
 val Player.mediaItems: List<MediaItem>
     get() =
@@ -101,7 +104,8 @@ val Player.mediaItems: List<MediaItem>
         }
 
 fun Player.findNextMediaItemById(mediaId: String): MediaItem? {
-    for (i in currentMediaItemIndex until mediaItemCount) {
+    val startIndex = currentMediaItemIndex.coerceAtLeast(0)
+    for (i in startIndex until mediaItemCount) {
         if (getMediaItemAt(i).mediaId == mediaId) {
             return getMediaItemAt(i)
         }
