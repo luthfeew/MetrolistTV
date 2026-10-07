@@ -52,6 +52,7 @@ import androidx.media3.common.Player.REPEAT_MODE_ALL
 import androidx.media3.common.Player.REPEAT_MODE_OFF
 import androidx.media3.common.Player.REPEAT_MODE_ONE
 import androidx.media3.common.Player.STATE_IDLE
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.Timeline
 import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.common.util.UnstableApi
@@ -240,6 +241,7 @@ import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.distinctUntilChangedBy
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
@@ -4738,12 +4740,32 @@ class MusicService :
     }
 
     /**
-     * Get the stream URL for a given media ID.
-     * This is used for Google Cast to send the audio URL to Chromecast.
+     * Stream information used for Google Cast.
      */
-    suspend fun getStreamUrl(mediaId: String): String? =
+    data class CastStream(
+        val url: String,
+        val mimeType: String,
+    )
+
+    /**
+     * Get the stream URL and MIME type for a given media ID.
+     * Checks cached stream first for instant playback, then fetches fresh data.
+     */
+    suspend fun getCastStream(mediaId: String): CastStream? =
         withContext(Dispatchers.IO) {
             try {
+                // 1. Fast path: check cached stream from local playback
+                songUrlCache[mediaId]?.let { cached ->
+                    val formatMime = database.format(mediaId).firstOrNull()?.mimeType?.substringBefore(";")
+                    val mime = when {
+                        formatMime?.contains("webm", ignoreCase = true) == true -> MimeTypes.AUDIO_WEBM
+                        formatMime?.contains("mp4", ignoreCase = true) == true || formatMime?.contains("m4a", ignoreCase = true) == true -> MimeTypes.AUDIO_MP4
+                        else -> MimeTypes.AUDIO_MP4
+                    }
+                    return@withContext CastStream(cached.url, mime)
+                }
+
+                // 2. Fetch fresh playback data
                 val song = database.songEntity(mediaId)
                 val playbackData =
                     InnerTubeXPlayer
@@ -4755,13 +4777,26 @@ class MusicService :
                                 isExplicit = song?.explicit,
                                 isUploaded = song?.isUploaded,
                             ),
-                        ).getOrNull()
-                playbackData?.streamUrl
+                        ).getOrNull() ?: return@withContext null
+
+                val formatMime = playbackData.format.mimeType.substringBefore(";")
+                val mime = when {
+                    formatMime.contains("webm", ignoreCase = true) -> MimeTypes.AUDIO_WEBM
+                    formatMime.contains("mp4", ignoreCase = true) || formatMime.contains("m4a", ignoreCase = true) -> MimeTypes.AUDIO_MP4
+                    else -> MimeTypes.AUDIO_MP4
+                }
+                CastStream(playbackData.streamUrl, mime)
             } catch (e: Exception) {
-                timber.log.Timber.e(e, "Failed to get stream URL for Cast")
+                timber.log.Timber.e(e, "Failed to get stream for Cast")
                 null
             }
         }
+
+    /**
+     * Get the stream URL for a given media ID.
+     * This is used for Google Cast to send the audio URL to Chromecast.
+     */
+    suspend fun getStreamUrl(mediaId: String): String? = getCastStream(mediaId)?.url
 
     /**
      * Initialize Google Cast support

@@ -9,12 +9,12 @@ import androidx.media3.cast.SessionAvailabilityListener
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
-import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.common.util.UnstableApi
 import com.google.android.gms.cast.framework.CastContext
+import com.metrolist.music.cast.MetrolistCastMediaItemConverter
 import com.metrolist.music.extensions.metadata
 import com.metrolist.music.ui.utils.resize
 import kotlinx.coroutines.CoroutineScope
@@ -183,6 +183,7 @@ class CastConnectionHandler(
             castPlayer =
                 RemoteCastPlayer
                     .Builder(context)
+                    .setMediaItemConverter(MetrolistCastMediaItemConverter())
                     .build()
                     .also { player ->
                         player.addListener(playerListener)
@@ -214,28 +215,33 @@ class CastConnectionHandler(
             scope.launch {
                 val localPlayer = musicService.player
                 val centerIndex = localPlayer.indexOfMediaId(metadata.id)
-                if (centerIndex == C.INDEX_UNSET) return@launch
 
-                val indices = queueIndices(centerIndex)
-                val items = indices.mapNotNull { resolvedMediaItem(it) }
-                val targetIndex = items.indexOfFirst { it.mediaId == metadata.id }
-                if (targetIndex == -1) {
-                    Timber.w("Unable to resolve the Cast queue for ${metadata.id}")
+                val currentItem = if (centerIndex != C.INDEX_UNSET) {
+                    resolvedMediaItem(centerIndex)
+                } else {
+                    resolvedMediaItemFromMetadata(metadata)
+                }
+
+                if (currentItem == null) {
+                    Timber.w("Unable to resolve Cast media item for ${metadata.id}")
                     return@launch
                 }
 
                 val startPosition =
-                    if (localPlayer.currentMediaItemIndex == centerIndex) {
+                    if (centerIndex != C.INDEX_UNSET && localPlayer.currentMediaItemIndex == centerIndex) {
                         localPlayer.currentPosition
                     } else {
                         0L
                     }
+
                 castPlayer?.apply {
-                    setMediaItems(items, targetIndex, startPosition)
+                    setMediaItems(listOf(currentItem), 0, startPosition)
                     prepare()
                     play()
                 }
                 localPlayer.pause()
+
+                appendQueueIfNeeded()
             }
     }
 
@@ -442,36 +448,13 @@ class CastConnectionHandler(
             }
     }
 
-    private fun queueIndices(centerIndex: Int): List<Int> {
-        val player = musicService.player
-        val timeline = player.currentTimeline
-        if (timeline.isEmpty) return listOf(centerIndex)
-
-        val previous = mutableListOf<Int>()
-        var index = centerIndex
-        while (previous.size < 2) {
-            index = timeline.getPreviousWindowIndex(index, Player.REPEAT_MODE_OFF, player.shuffleModeEnabled)
-            if (index == C.INDEX_UNSET) break
-            previous.add(0, index)
-        }
-
-        val next = mutableListOf<Int>()
-        index = centerIndex
-        while (next.size < 3) {
-            index = timeline.getNextWindowIndex(index, Player.REPEAT_MODE_OFF, player.shuffleModeEnabled)
-            if (index == C.INDEX_UNSET) break
-            next += index
-        }
-        return previous + centerIndex + next
-    }
-
     private suspend fun resolvedMediaItem(index: Int): MediaItem? =
         runCatching {
             val player = musicService.player
             if (index !in 0 until player.mediaItemCount) return null
             val item = player.getMediaItemAt(index)
             val metadata = item.metadata ?: return null
-            val streamUrl = musicService.getStreamUrl(metadata.id) ?: return null
+            val stream = musicService.getCastStream(metadata.id) ?: return null
             val castMetadata =
                 item.mediaMetadata
                     .buildUpon()
@@ -483,8 +466,27 @@ class CastConnectionHandler(
                     .build()
             item
                 .buildUpon()
-                .setUri(streamUrl)
-                .setMimeType(MimeTypes.AUDIO_MP4)
+                .setUri(Uri.parse(stream.url))
+                .setMimeType(stream.mimeType)
+                .setMediaMetadata(castMetadata)
+                .build()
+        }.getOrNull()
+
+    private suspend fun resolvedMediaItemFromMetadata(metadata: AppMediaMetadata): MediaItem? =
+        runCatching {
+            val stream = musicService.getCastStream(metadata.id) ?: return null
+            val castMetadata =
+                androidx.media3.common.MediaMetadata.Builder()
+                    .setTitle(metadata.title)
+                    .setArtist(metadata.artists.joinToString(", ") { it.name })
+                    .setAlbumTitle(metadata.album?.title)
+                    .setArtworkUri(metadata.thumbnailUrl?.resize(1080, 1080)?.let(Uri::parse))
+                    .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+                    .build()
+            MediaItem.Builder()
+                .setMediaId(metadata.id)
+                .setUri(Uri.parse(stream.url))
+                .setMimeType(stream.mimeType)
                 .setMediaMetadata(castMetadata)
                 .build()
         }.getOrNull()
